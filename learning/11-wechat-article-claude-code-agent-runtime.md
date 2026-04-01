@@ -1,163 +1,676 @@
-# 为什么说 Claude Code 不是一个 CLI，而是一套 Agent Runtime
+# Claude Code 2.1.88 的 Agent Runtime 拆解
 
-如果你把 Claude Code 2.1.88 只看成“一个会调模型、会跑 Bash 的命令行工具”，那其实只看到了它最表面的那层壳。
+研究 `Claude Code` 最容易陷入两个误区。
 
-这次沿着 `restored-src/src/` 往下拆，我越来越确定一件事：Claude Code 最值得学习的，不是某个 prompt 技巧，也不是某个工具定义，而是它已经把编码 Agent 做成了一套完整的 Runtime。
+第一个误区，是把它理解成“一个带 Bash、Read、Edit 的命令行工具”。第二个误区，是把它理解成“一个复杂一些的 prompt 工程项目”。
 
-## 一、从 `learn-claude-code` 往上看，最容易看懂 Claude Code
+这两个理解都不对。
 
-`learn-claude-code` 这套仓库其实特别有价值，因为它把 Claude Code 背后的范式拆成了最小单元：
+沿着 `restored-src/src/` 这版还原代码看下来，Claude Code 2.1.88 的本质更接近一套完整的 Agent Runtime。CLI 只是它的一个宿主壳，prompt 只是它运行时的一部分输入，而真正决定系统行为的，是下面那套状态、权限、扩展、压缩、多代理和远程桥接机制。
 
-- `s01` 讲清楚 Agent Loop
-- `s02` 讲清楚 Tool Use
-- `s04` 讲清楚 Subagent 的本质是上下文隔离
-- `s05` 讲清楚 Skill 应该按需加载
-- `s06` 讲清楚 Compact 是长会话的生存条件
-- `s07-s12` 讲清楚任务系统、后台执行、团队协作、自治与 worktree 隔离
+这篇文章不做功能罗列，也不复述“Claude Code 会什么”。重点只有一件事：把它的 Runtime 零件一层一层拆开，看清楚一次请求究竟是怎样穿过这台机器的。
 
-如果说 `learn-claude-code` 是教科书版，那么 Claude Code 2.1.88 就是生产版。
+我会把 `learn-claude-code` 当作对照物。那套仓库的价值，在于它把 Claude Code 背后的范式拆成了可以一眼看清的最小单元；而 Claude Code 的源码，则展示了同一套范式如何被推进到产品级运行时。
 
-区别不在“原理变了”，而在“同一套原理被推进到了工程系统级别”。
+## 一、先下结论：Claude Code 不是“一个 Agent”，而是 Agent 的运行时
 
-## 二、Claude Code 真正的主干，不在 CLI，而在 Runtime 内核
+如果只从使用者视角看，Claude Code 像是一个会帮你写代码的 Agent。但从源码结构看，它做的事要更具体得多。
 
-它的真正主干链路大致是：
+它不负责创造智能。智能来自模型。Claude Code 负责的是另外几件更工程化的事情：
 
-- `main.tsx` 负责入口改写和模式分流
-- `REPL.tsx` 负责交互状态装配
-- `query.ts` / `QueryEngine.ts` 负责 Agent Loop
-- `Tool.ts` / `tools.ts` 负责能力治理
-- `AgentTool.tsx` / `tasks/*` 负责多代理与任务化执行
-- `compact.ts` / `sessionStorage.ts` / `memdir.ts` 负责续航与恢复
-- `loadSkillsDir.ts` / `services/mcp/client.ts` 负责扩展系统
+1. 把用户输入和当前工作环境装配成当前这一轮的执行上下文。
+2. 决定这一轮模型能看见什么工具、什么资源、什么技能。
+3. 在模型返回 `tool_use` 之后，执行工具、记录状态、更新上下文，再把控制权送回模型。
+4. 当上下文膨胀、会话切换、子代理生成、远程连接建立时，保证这套状态机还能继续跑。
 
-这意味着 Claude Code 的核心问题早就不是“怎么调用一次模型”，而是：
+这四件事凑在一起，才是 Runtime。
 
-- 如何持续运行
-- 如何治理工具
-- 如何恢复会话
-- 如何扩展能力
-- 如何托管多个代理
+所以它的核心不是“某个 prompt 写得多巧”，而是这一整套运转机构能否稳定、可恢复、可扩展、可治理。
 
-这正是 Runtime 的问题域。
+## 二、从一次请求开始：Claude Code 的主执行链不是线性的 CLI 流程
 
-## 三、它最强的地方，是把 Agent 的“工程现实”全部显式化了
+先把一轮请求穿过去，很多部件就自然能对上。
 
-很多 demo 型 Agent，默认世界非常单纯：
+### 1. 入口层先做的不是解析参数，而是决定“这次会话属于哪个宿主”
 
-- 当前目录就是工作区
-- 工具看得到就能调用
-- 子代理只是再跑一次 loop
-- 对话太长就随便总结一下
-- 远程能力就是多一个 API
+`main.tsx` 的 `main()` 在很早的阶段就开始重写 argv 和切换模式。最典型的几段在：
 
-Claude Code 不是这样。
+- `main.tsx:609-640`：把 `cc://` 和 `cc+unix://` 改写成 direct connect 流程
+- `main.tsx:679-699`：把 `claude assistant` 改写成主命令路径
+- `main.tsx:702-794`：把 `claude ssh <host>` 改写成本地 UI + 远端执行的 SSH 会话
+- `main.tsx:797-833`：在初始化之前判断当前是不是 non-interactive、是不是 SDK、是不是 remote 入口
 
-它把这些事情都显式建模了：
+这意味着 `main.tsx` 干的不是传统 CLI 的“命令分发”，而是更像一个 host router。它先决定：
 
-- working directory 是资源边界
-- permission mode 是能力治理层
-- subagent 有 fresh、fork、background、remote 等不同语义
-- compact 后要重建 plan、skill、tool delta、async agent 状态
-- session title、tag、worktree、PR link 要能 append-only 恢复
-- MCP 不只是工具列表，而是带认证、资源、技能、重连机制的能力总线
+- 这次会话是在本地 CLI 跑
+- 还是连到一个 `cc://` server
+- 还是通过 `ssh` 把执行迁到远端
+- 还是进入 `assistant` / SDK / remote session 形态
 
-你会发现，Claude Code 的工程重点从来不在“让模型多想一步”，而在“让模型所处的世界足够稳定、可控、可恢复”。
+这一步很关键。因为从这里开始，Claude Code 的设计目标就已经不是“本地命令行程序”，而是“同一套 Runtime 可以挂在多个宿主上”。
 
-## 四、这套 Runtime 最值得普通开发者学的 4 件事
+再看 `main.tsx:3960-4037` 和 `4055-4095`，这个判断会更明确：
 
-### 1. 不要把工具系统做成 dispatch map 就停下
+- `claude server` 可以把 Runtime 变成 session host
+- `claude open <cc-url>` 可以把本地进程变成 remote client
+- `claude ssh` 可以把 UI 和执行宿主拆开
 
-dispatch map 只是开始。更重要的是：
+这是第一层骨架：**它先是 Runtime，后是 CLI。**
 
-- 工具何时可见
-- 工具何时可调用
-- 子代理的工具池是否独立
-- skill 是否能绑定 allowed-tools
+### 2. 真正进入交互后，REPL 不是简单读输入，而是在装配一轮“可执行回合”
 
-Claude Code 真正厉害的地方，是把 tool system 做成了 capability governance。
+很多人会自然以为：用户输入一段文本，系统把它丢给模型，模型开始输出工具调用。这种理解只适合最小 demo。
 
-### 2. Compact 的目标不是省 token，而是保住工作态
+Claude Code 的 `REPL.tsx` 做的事情复杂得多。
 
-教程版 compact 的重点是“无限会话”；Claude Code 的重点是“压缩完还能继续干活”。
+关键逻辑在 `REPL.tsx:2701-2803`。这一段最重要的不是 `query(...)` 调用本身，而是调用之前发生的事情：
 
-这就是为什么它会在 compact 后重新注入：
+1. 把当前 slash command / skill 的 `allowed-tools` 写入 `toolPermissionContext`
+2. 重新读取当前 store 中最新的 tools 和 MCP clients，而不是用闭包里旧快照
+3. 根据当前模型、当前工具、当前 working directories、当前 MCP 连接，重新生成默认 system prompt
+4. 叠加 coordinator mode、scratchpad、terminal focus、custom system prompt、append system prompt 等额外上下文
+5. 最后才调用 `query(...)`
 
-- plan
-- skill
-- deferred tools
-- agent listing
-- MCP instructions
+其中 `REPL.tsx:2701-2726` 很能说明问题。skill frontmatter 里的 `allowed-tools` 不只是文档元数据，它会在这一轮开始前被写进全局的 `alwaysAllowRules.command`。也就是说，技能不是“告诉模型应该怎么做”，而是会同步改变当前这一轮的能力边界。
 
-这不是摘要器，这是状态搬运器。
+而 `REPL.tsx:2768-2787` 则展示了另一层事实：system prompt 在 Claude Code 里不是一个常量，而是每一轮按当前运行时状态重新反射出来的结果。
 
-### 3. 多代理不是多开几个模型，而是任务运行时
+这一步非常重要，因为它决定了 Claude Code 的执行单元不是“消息”，而是“一个回合”。每一回合在发起模型请求之前，都会先把当前世界重新装配一遍。
 
-Claude Code 的多代理体系里，有：
+### 3. `query.ts` 才是真正的 Agent Kernel
 
-- `AgentTool`
-- `LocalAgentTask`
-- `RemoteAgentTask`
-- `coordinatorMode`
-- `task-notification` 协议
+如果说 `main.tsx` 是宿主层，`REPL.tsx` 是回合装配层，那么 `query.ts` 才是 Claude Code 真正的 Agent Kernel。
 
-这说明真正的多代理能力，不是“并发开几个请求”，而是：
+`query.ts:181-198` 先定义了 `QueryParams`，里面除了常见的 `messages`、`systemPrompt`、`userContext`、`toolUseContext`，还有几个特别有意思的字段：
 
-- 有任务 ID
-- 有状态
-- 有输出文件
-- 有通知协议
-- 可 resume
-- 可 worktree 隔离
+- `fallbackModel`
+- `maxTurns`
+- `skipCacheWrite`
+- `taskBudget`
 
-### 4. 扩展系统要统一成能力图
+这些字段已经说明，Claude Code 的 query 不是“问模型一次”，而是一条能受预算、轮数和恢复策略约束的执行链。
 
-本地 skill、MCP tool、MCP resource、MCP skill、command，在 Claude Code 里都不是散装功能，而是统一进入 Runtime 能力平面。
+更关键的是 `query.ts:203-217` 的 `State`。它明确把跨迭代的可变状态列出来：
 
-这会让你的系统在后期非常受益，因为：
+- `messages`
+- `toolUseContext`
+- `autoCompactTracking`
+- `maxOutputTokensRecoveryCount`
+- `hasAttemptedReactiveCompact`
+- `maxOutputTokensOverride`
+- `pendingToolUseSummary`
+- `turnCount`
+- `transition`
 
-- prompt 能统一反射
-- UI 能统一展示
-- 权限能统一治理
-- resume 能统一恢复
+这说明 `query()` 的内部模型不是 request-response，而是一个循环状态机。
 
-## 五、Claude Code 给开发 Agent 的人最大的启发
+再看 `query.ts:241-307` 和后面的主循环，Claude Code 每轮至少要处理这些问题：
 
-我觉得最大启发其实只有一句话：
+1. 当前是否需要压缩上下文
+2. 当前是否需要做 memory prefetch / skill discovery prefetch
+3. 当前工具结果是否需要做 budget trimming
+4. 当前这一轮请求该走哪个模型、用什么 thinking config、带哪些工具
+5. 收到流式输出后，何时写 assistant message，何时写 stream event
+6. 收到 `tool_use` 之后，工具如何执行、结果如何回灌、状态如何继续
 
-**不要把自己理解成“在做一个 AI 功能”，而要把自己理解成“在做一个能让模型稳定工作的 Runtime”。**
+这套逻辑和 `learn-claude-code` 的 `s01` 是同一条血脉，只是工业化程度完全不同。`s01` 讲的是：
 
-一旦这个视角成立，很多设计决策会自然变清楚：
+```text
+while stop_reason == tool_use:
+  调模型
+  执行工具
+  回写 tool_result
+```
 
-- 为什么要有 transcript
-- 为什么要有 metadata
+Claude Code 保留了这个骨架，但把它扩展成了一个受限的、带恢复机制的、可做预算管理和上下文迁移的循环内核。
+
+### 4. `QueryEngine` 把同一个 Kernel 变成 SDK / headless 可复用会话
+
+理解 Claude Code 的一个关键点，是不要把 REPL 和核心执行逻辑混成一坨。它其实已经在主动抽离。
+
+`QueryEngine.ts:130-183` 直接把 `QueryEngine` 定义成“拥有 query lifecycle 和 session state 的对象”。这句话基本就是 Runtime 的自我描述。
+
+它内部维护的是一组长期状态：
+
+- `mutableMessages`
+- `abortController`
+- `permissionDenials`
+- `totalUsage`
+- `readFileState`
+- `discoveredSkillNames`
+- `loadedNestedMemoryPaths`
+
+而 `submitMessage()` 在 `QueryEngine.ts:675-686` 最终还是调用了 `query(...)`。也就是说：
+
+- `query.ts` 提供循环内核
+- `QueryEngine` 提供会话对象和持久状态
+- `REPL.tsx` 提供交互宿主
+
+这就是一个很典型的 Runtime 分层。
+
+`QueryEngine.ts:687-875` 还有一层很值得注意。它在流式处理过程中，会把：
+
+- assistant
+- user
+- compact boundary
+- progress
+- attachment
+
+都明确写进 `mutableMessages` 和 transcript。它并不只关心“最后的回复是什么”，而是把整个回合里发生的事件都变成会话状态的一部分。
+
+这件事后面会直接影响 compact、resume 和 remote session。
+
+## 三、Claude Code 的核心零件，其实可以拆成 7 层
+
+如果把整个运行时压成一张架构图，我会这么画：
+
+```text
+Host Shell
+  -> Turn Assembler
+    -> Query Kernel
+      -> Capability Governance
+      -> Continuity System
+      -> Concurrency System
+      -> Extension System
+      -> Remote Bridge
+```
+
+下面把这几层逐层拆开。
+
+## 四、Capability Governance：Claude Code 最成熟的部分，不是工具本身，而是工具治理
+
+大多数 Agent Demo 的工具系统，核心只有一层：注册一个 schema，再挂一个 handler。
+
+Claude Code 的重点不在这里。它真正做的是把“工具存在”与“工具是否可见、是否可调用、是否需要审批”拆开。
+
+### 1. `ToolPermissionContext` 不是一个简单 mode，而是一整块执行环境
+
+`Tool.ts:123-138` 里的 `ToolPermissionContext` 有这些字段：
+
+- `mode`
+- `additionalWorkingDirectories`
+- `alwaysAllowRules`
+- `alwaysDenyRules`
+- `alwaysAskRules`
+- `isBypassPermissionsModeAvailable`
+- `isAutoModeAvailable`
+- `shouldAvoidPermissionPrompts`
+- `awaitAutomatedChecksBeforeDialog`
+- `prePlanMode`
+
+这段类型定义非常重要。因为它告诉我们，Claude Code 的权限模型不是一个 `"acceptEdits" | "bypass"` 枚举，而是一块完整的运行时上下文。
+
+它同时携带：
+
+- 当前模式
+- 目录边界
+- 允许规则
+- 拒绝规则
+- 提问规则
+- UI 是否允许弹权限框
+- 自动模式当前是否可进入
+
+所以在 Claude Code 里，“权限”这个词的真实含义是：**当前这轮、当前这个执行体，在当前这组目录和规则下，哪些能力是可见且可执行的。**
+
+### 2. 权限规则是在系统启动和每轮执行之间被逐层叠加出来的
+
+`utils/permissions/permissionSetup.ts:913-1015` 很适合拿来理解这块逻辑。
+
+它先构建 `additionalWorkingDirectories`，还特地处理了 `process.env.PWD` 是 symlink、`getOriginalCwd()` 是 real path 的情况。然后它再叠加：
+
+- CLI 传入的 allow / deny
+- disk 上的 permission rules
+- settings 中的 `additionalDirectories`
+- `--add-dir`
+
+最后才得到完整的 `toolPermissionContext`。
+
+也就是说，权限上下文不是静态配置读取结果，而是一个多来源合流后的运行结果。
+
+### 3. Auto Mode 也不是布尔开关，而是能力门控
+
+`permissionSetup.ts:1078-1127` 清楚地展示了 auto mode 的真实语义：
+
+- 先看 GrowthBook 动态配置
+- 再看 settings 是否禁用
+- 再看当前主模型是否支持 auto mode
+- 再看 `disableFastMode` breaker 是否触发
+
+最后才得到两个关键结论：
+
+- `carouselAvailable`
+- `canEnterAuto`
+
+这意味着 auto mode 在 Claude Code 里是一个运行时 capability gate，不是一个 UI 选项。
+
+### 4. 工具会在“模型看见之前”就被过滤掉
+
+`tools.ts:253-269` 的 `filterToolsByDenyRules(...)` 做了一个产品级系统一定要做的动作：在工具真正进入模型视野之前，先按 deny rules 把它们剔除。
+
+这一点非常关键。
+
+很多系统只在调用时做拦截，结果模型还是能看见这个工具，于是会不断尝试调用，造成：
+
+- 错误推理
+- token 浪费
+- 模型对环境边界的误判
+
+Claude Code 在 `tools.ts:271-327` 和 `345-349` 继续把这套策略落到底：
+
+- built-in tools 先按 mode 过滤
+- MCP tools 再按 deny rules 过滤
+- 最后 dedupe 成完整 tool pool
+
+这是一个非常成熟的设计。因为它把“工具系统”从 dispatch map 升级成了 capability governance。
+
+## 五、Continuity System：Claude Code 解决的不是“上下文太长”，而是“长会话还能继续工作”
+
+Claude Code 另一块明显高于一般 Agent Demo 的地方，在于它对连续性的处理。
+
+这里的“连续性”不是指用户能看到聊天记录，而是指系统能否在经历压缩、恢复、切换之后，继续像之前那样工作。
+
+### 1. Compact 在 Claude Code 里是状态迁移，不是摘要器
+
+`services/compact/compact.ts:518-585` 几乎是整套 Runtime 最值得反复读的代码之一。
+
+压缩成功之后，它做的事情不是简单塞一段 summary，而是重建一组后压缩附件：
+
+- 读过的文件附件
+- 异步 agent 附件
+- plan attachment
+- plan mode attachment
+- skill attachment
+- deferred tools delta
+- agent listing delta
+- MCP instructions delta
+
+这背后其实是一个非常明确的判断：**对 Agent 来说，压缩后的首要任务不是保留对话内容，而是保留工作态。**
+
+这也是为什么 Claude Code 的 compact 之后，系统还能继续知道：
+
+- 当前有哪些已加载技能
+- 当前有哪些工具 schema 已经在上下文里
+- 当前有哪些异步子代理还在跑
+- 当前是否处于 plan mode
+
+这不是摘要行为，这是运行时状态迁移。
+
+### 2. Compact boundary 是显式状态边界，不是隐藏重写
+
+同一段代码里，`compact.ts:596-623` 会创建：
+
+- `compact boundary marker`
+- `compact summary message`
+
+还会把压缩前已经发现的 deferred tools 一起写进 boundary metadata。
+
+这非常重要。因为 Claude Code 没有偷偷“改写历史”，而是把压缩视作一次正式事件，显式写进消息流。
+
+从 Runtime 角度看，这相当于：
+
+- 前面是一段完整执行历史
+- 这里发生了一次状态折叠
+- 后面从新的状态基线继续执行
+
+这样设计，resume、调试、remote replay 都会清晰得多。
+
+### 3. Session Storage 不是日志，而是 append-only 的状态尾部索引
+
+`utils/sessionStorage.ts:722-839` 解释了 Claude Code 为什么能稳定做 `/resume`。
+
+它会不断把这些 metadata 重新追加到 transcript 尾部：
+
+- `last-prompt`
+- `custom-title`
+- `tag`
+- `agent-name`
+- `agent-color`
+- `agent-setting`
+- `mode`
+- `worktree-state`
+- `pr-link`
+
+注意这里的关键不是“存了什么”，而是“写在哪里”。它用的是 append-only transcript 尾部重 stamping 机制，让 resume 所需字段始终落在 tail scan 可见窗口里。
+
+这是一个非常漂亮的工程做法。它避开了：
+
+- 全文件重写
+- 额外索引数据库
+- 复杂同步协议
+
+代价只是追加几条 JSONL 元数据。
+
+### 4. Memory 也不是隐式缓存，而是文件系统协议
+
+`memdir/memdir.ts:34-102` 和 `199-257` 表明 Claude Code 的 Memory 系统是一套显式的 file-based protocol：
+
+- `MEMORY.md` 是索引入口，不是正文
+- 每条 memory 独立存文件
+- 有固定类型
+- 有清晰的“什么应该存、什么不应该存”规则
+
+这种设计和很多 embedding memory 正好相反。Claude Code 更偏向一个可以被审计、可被版本化、可被约束的记忆系统。
+
+这很符合它整个 Runtime 的风格：重要状态不隐藏，要显式化、文件化、可恢复。
+
+## 六、Concurrency System：Claude Code 的多代理不是“多开几个模型”，而是一套任务运行时
+
+很多人在谈多代理时，讨论重点放在：
+
+- leader / planner / coder / reviewer 如何分工
+- prompt 应该怎么写
+
+Claude Code 的源码提醒我们，这些都不是第一问题。第一问题是：**多代理怎么被 Runtime 托管。**
+
+### 1. `AgentTool` 的输入 schema，本身就是一份 spawn 协议
+
+`AgentTool.tsx:81-138` 这段 schema 很能说明问题。它允许模型和宿主显式指定：
+
+- `description`
+- `prompt`
+- `subagent_type`
+- `model`
+- `run_in_background`
+- `name`
+- `team_name`
+- `mode`
+- `isolation`
+- `cwd`
+
+这已经不是“调用一个 task 工具”，而是在声明一个执行体应该如何被创建。
+
+这里面至少区分了：
+
+- 角色
+- 生命周期
+- 隔离方式
+- 命名与路由
+- 权限模式
+- 执行目录
+
+所以 Claude Code 的 spawn 语义从一开始就是显式的。
+
+### 2. worker 的工具池不是继承父代理，而是重新装配
+
+`AgentTool.tsx:568-577` 是一个非常关键的产品级决策：
+
+子代理会根据自己的 permission mode 重新 `assembleToolPool(...)`，而不是直接继承父代理的工具集合。
+
+这样做的意义很大：
+
+- 父代理的审批历史不会直接泄露给子代理
+- 不同 agent type 可以绑定不同能力边界
+- 工具集可以随着 spawn 语义一起变化
+
+这也是为什么 Claude Code 的多代理不是“共享一个世界”，而是“每个执行体拿到自己的局部世界”。
+
+### 3. worktree 不是 Git 技巧，而是 Runtime 官方隔离模式
+
+`AgentTool.tsx:582-593` 会在需要时创建 `agent worktree`。后面的 `643-685` 则决定：
+
+- 没有改动时自动清理
+- 有改动则保留
+- 如果是 hook-based worktree，则默认保留
+
+这是很典型的 Runtime 思路。worktree 在这里不再是工程师手工使用的 git 技巧，而是 Runtime 提供的一种隔离执行面。
+
+### 4. `LocalAgentTask` 把后台代理纳入统一任务框架
+
+`tasks/LocalAgentTask/LocalAgentTask.tsx:197-260` 会把后台 agent 的结果包装成 `<task-notification>` XML：
+
+- `task-id`
+- `output-file`
+- `status`
+- `summary`
+- 可选 `result`
+- 可选 `usage`
+- 可选 `worktree`
+
+这段设计非常重要。因为它意味着多代理通信不是自由文本，而是结构化事件协议。
+
+同一文件里还有另一个很关键的点：后台代理的状态会被统一记录成 task state，包含：
+
+- `progress`
+- `messages`
+- `pendingMessages`
+- `isBackgrounded`
+- `retain`
+- `diskLoaded`
+
+换句话说，本地子代理在 Claude Code 里不是 Promise，而是 task。
+
+### 5. Coordinator 模式把“多代理协作”上升成系统角色
+
+`coordinator/coordinatorMode.ts:116-214` 直接把 coordinator 的系统提示写成一份调度手册：
+
+- 什么时候应该启 worker
+- 什么任务应该并行
+- worker 完成后结果会怎样送回来
+- 哪些事情不该委托
+
+这说明 Claude Code 的多代理不是在 prompt 上临时拼出来的团队，而是 Runtime 官方支持的一种角色模式。
+
+## 七、Extension System：Claude Code 的扩展不是插件市场，而是能力图
+
+Claude Code 的另一块关键能力，是它把本地技能、远程 MCP 工具、MCP 资源、MCP 命令、MCP skill 都收进了同一套扩展平面。
+
+### 1. Skill 在 Claude Code 里不是一段 markdown，而是正式命令对象
+
+`skills/loadSkillsDir.ts:237-264` 解析的 frontmatter 远超过教程版 `s05`：
+
+- `allowed-tools`
+- `arguments`
+- `when_to_use`
+- `version`
+- `model`
+- `disable-model-invocation`
+- `user-invocable`
+- `hooks`
+- `context`
+- `agent`
+- `effort`
+- `shell`
+
+而 `loadSkillsDir.ts:270-399` 又把它真正转成一个 `Command`。
+
+这里最关键的判断有两个。
+
+第一，skill 不是纯知识块，它会改变执行语义。比如：
+
+- `allowed-tools` 会改变这一轮权限
+- `context: fork` 会影响执行上下文
+- `model` / `effort` 会影响本轮模型策略
+
+第二，Claude Code 明确区分本地 skill 和远程 skill 的信任边界。`loadSkillsDir.ts:371-395` 直接禁止 MCP skill 执行内联 shell，因为它们是 remote and untrusted。
+
+这是一种非常成熟的 provenance-aware extension design。扩展不是平等的，来源决定信任等级。
+
+### 2. MCP 在 Claude Code 里不是“远程工具列表”，而是远程能力总线
+
+`services/mcp/client.ts` 的规模已经说明，这一层远远不只是 `listTools` + `callTool`。
+
+关键逻辑在 `mcp/client.ts:2169-2198` 和 `2226-2371`。
+
+如果一个 MCP server 支持 resources，Claude Code 会并行拉取：
+
+- tools
+- commands
+- mcp skills
+- resources
+
+然后再统一装配回来。
+
+同时，它会处理：
+
+- local vs remote server 的并发差异
+- 401 needs-auth 缓存
+- 无 token 发现路径
+- `createMcpAuthTool(...)`
+- 资源工具 `ListMcpResourcesTool` / `ReadMcpResourceTool`
+
+`mcp/client.ts:2301-2318` 还专门处理了“最近返回过 401 的 server 暂时不重连”的情况。这不是细节优化，而是一个产品级判断：MCP 连接状态本身就是 Runtime 状态的一部分。
+
+所以在 Claude Code 里，MCP 的含义是：
+
+- 远程工具平面
+- 远程资源平面
+- 远程命令平面
+- 远程 skill 平面
+- 远程认证状态平面
+
+这已经不是“插件系统”，而是能力图。
+
+## 八、Remote Bridge：Claude Code 远程模式最关键的，不是连通，而是协议桥接
+
+如果说 `main.tsx` 证明它是多宿主 Runtime，那么 `remote/RemoteSessionManager.ts` 和 `remote/sdkMessageAdapter.ts` 则说明，它并没有把远程会话简化成“把远端输出打印回来”。
+
+### 1. `RemoteSessionManager` 管理的是控制协议，而不是单纯消息收发
+
+`RemoteSessionManager.ts:146-214` 这一段很能说明问题。
+
+远端发回来的消息会被分成：
+
+- `control_request`
+- `control_cancel_request`
+- `control_response`
+- `SDKMessage`
+
+其中 `control_request` 里最重要的一种是 `can_use_tool`。也就是说，远端执行体需要权限确认时，并不是自己随便处理，而是把 permission request 桥接回本地宿主。
+
+这是一个很本质的设计决定：**执行宿主可以远程化，但控制权不能漂走。**
+
+### 2. `sdkMessageAdapter` 负责把远程协议语义映射回本地会话语义
+
+`sdkMessageAdapter.ts:21-148` 把远端 SDK 消息转换成本地 REPL 理解的：
+
+- `AssistantMessage`
+- `StreamEvent`
+- `SystemMessage`
+- `CompactBoundaryMessage`
+
+这看起来像适配层，实际上是在做一件更重要的事：把远端运行时事件重新纳入本地 transcript 语义。
+
+这一步一旦缺失，remote session 就只能是日志流；一旦做对，remote session 才能继续拥有：
+
+- 本地滚动 UI
+- 本地 compact 语义
+- 本地 resume 语义
+- 本地权限交互
+
+这也是为什么 Claude Code 的远程能力不像“远程终端”，而更像“远程会话镜像”。
+
+## 九、把它和 `learn-claude-code` 放在一起看，Claude Code 的演进路线就很清楚了
+
+`learn-claude-code` 很适合做骨架对照，因为它把 Claude Code 这台机器拆成了最小原型。
+
+大致可以这么对应：
+
+- `s01` 对应 `query.ts` 的 loop kernel
+- `s02` 对应 `tools.ts` 的工具装配入口
+- `s04` 对应 `AgentTool` / `runAgent` 的 fresh subagent 语义
+- `s05` 对应 `loadSkillsDir.ts` 的按需技能注入
+- `s06` 对应 `compact.ts` 的上下文折叠
+- `s07-s12` 对应 task framework、background agents、team coordination、worktree isolation
+
+但教程版和产品版之间有一条关键分界线。
+
+教程版关注的是“范式最小成立”：
+
+- loop 能不能闭合
+- tool_use 能不能执行
+- subagent 能不能隔离
+- compact 能不能触发
+
+Claude Code 关注的是“范式如何在真实产品里长期存活”：
+
+- 权限边界怎么治理
+- transcript 怎么恢复
+- metadata 怎么落盘
+- 子代理怎么 resume
+- 扩展系统怎么分信任等级
+- remote session 怎么桥接本地控制面
+
+这就是从 Harness Demo 到 Runtime 的差别。
+
+## 十、对 Agent 开发者最重要的启发，不在“学几个技巧”，而在换一套架构视角
+
+如果要把这次拆解最后落到实践上，我觉得有六条结论最重要。
+
+### 1. 不要把自己当成“在写一个会调模型的产品功能”
+
+真正需要构建的是 Runtime。至少要把下面几层拆开：
+
+- Host shell
+- Turn assembler
+- Query kernel
+- Capability governance
+- Continuity
+- Concurrency
+- Extension
+
+如果这些层一开始就糊在一起，后面一定会被 compact、resume、task、remote 模式反噬。
+
+### 2. 工具系统的重点不是 handler，而是 visibility 和 boundary
+
+Claude Code 最值得抄的，不是工具数量，而是它在工具进入模型视野之前就做过滤。
+
+模型看见什么，往往比模型最终能不能调更重要。
+
+### 3. Compact 的目标不是“省 token”，而是“做状态迁移”
+
+一旦把 compact 理解成状态迁移，很多设计自然就会对：
+
 - 为什么要有 compact boundary
-- 为什么要有 task framework
-- 为什么要有 worktree isolation
-- 为什么要把 MCP 当成能力总线
+- 为什么要重建 attachments
+- 为什么要保留 tool discovery 状态
 
-因为这些都不是装饰，它们是 Runtime 的基础设施。
+反过来，如果把它当摘要器来写，系统很快就会在长会话里变钝。
 
-## 六、`learn-claude-code` 和 Claude Code，应该怎么一起学
+### 4. 多代理必须先有 Task Framework，后有 Team Prompt
 
-我的建议非常直接：
+如果没有：
 
-第一遍先看 `learn-claude-code`，把范式学会。
+- task id
+- output file
+- lifecycle state
+- structured notification
+- resume metadata
 
-第二遍再看 Claude Code 2.1.88，对着源码找这些范式在真实产品里是如何被扩展成：
+那么所谓多代理，本质上只是几个并发请求。
 
-- 状态层
-- 治理层
-- 恢复层
-- 任务层
-- 宿主层
+### 5. 扩展系统一定要按来源划分信任等级
 
-这样你不会被源码体量淹没，也不会只记住一些零散技巧。
+本地 markdown skill、插件 skill、MCP skill、MCP resource、MCP tool，不应该是同一类东西。Claude Code 之所以稳，就是因为它承认扩展来源不同，信任等级就不同。
 
-## 七、最后的判断
+### 6. 如果你的产品会长出 server、SDK、remote，就尽早做消息适配层和控制桥
 
-Claude Code 值得研究的地方，不是因为它“功能很多”，而是因为它代表了一种非常成熟的 Agent 产品思路：
+这不是“等以后再重构”的问题。宿主壳一旦和内核黏死，远程化成本会非常高。
 
-模型负责智能，Runtime 负责世界。
+Claude Code 提前把：
 
-而真正强大的 Agent 产品，拼到最后，拼的恰恰是这个世界搭得够不够好。
+- protocol message
+- local transcript message
+- permission request
+- session metadata
+
+都拆开了，所以它才能在 CLI、server、remote、ssh 之间切换。
+
+## 十一、最后的判断
+
+Claude Code 2.1.88 最值得研究的，不是它“会不会写代码”，也不是它“工具多不多”。真正值得研究的是，它已经把编码 Agent 所需要的工程现实全部收进了一套 Runtime 里。
+
+它知道：
+
+- 一次请求不是一句 prompt，而是一个回合
+- 一个回合不是一次 API 调用，而是一段状态机迭代
+- 一个会话不是消息数组，而是可压缩、可恢复、可迁移的运行状态
+- 一个子代理不是一句委托话术，而是一个可治理的执行体
+- 一个扩展不是一段额外提示词，而是一块带来源、带权限、带信任边界的能力
+
+这套理解，比任何单个技巧都重要。
+
+因为对今天做 Agent 的工程师来说，真正的分水岭已经不是“会不会调模型”，而是有没有能力把模型放进一个设计良好的世界里，让它长时间、稳定地工作。
+
+Claude Code 给出的答案很明确：模型负责智能，Runtime 负责世界。
+
+而工程的难度，恰恰就在这个世界怎么搭。
